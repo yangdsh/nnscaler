@@ -33,27 +33,27 @@ torchrun --nproc_per_node=$NGPUS \
     examples/swin/train.py \
         --mbs 1 --gbs $GBS --policy $POLICY \
         --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
-        --max-pp 2 \
+        --max-pp 2 --dev0-mem-limit 24 --mem-frac 0.7 \
         --recompute --db-cache swin_${GPU}_db.json --save-spec swin.alpa.4gpus.json \
     2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.$POLICY.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log
 
 
-POLICY=alpa
+# POLICY=alpa
 
-torchrun --nproc_per_node=$NGPUS \
-    examples/swin/train.py \
-        --mbs 1 --gbs $GBS --policy $POLICY \
-        --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
-        --max-pp 1 \
-        --recompute --db-cache swin_${GPU}_db.json --save-spec swin.alpa.4gpus.json \
-    2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.$POLICY.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log
+# torchrun --nproc_per_node=$NGPUS \
+#    examples/swin/train.py \
+#        --mbs 1 --gbs $GBS --policy $POLICY \
+#        --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
+#        --max-pp 1 \
+#        --recompute --db-cache swin_${GPU}_db.json --save-spec swin.alpa.4gpus.json \
+#    2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.$POLICY.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log
 
 
 # deepspeed
 
-torchrun --nproc_per_node=$NGPUS \
-    examples/swin/train_ds.py \
-        --mbs 1 --gbs $GBS \
-        --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
-        --tp 2 --offload cpu \
-    2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.ds.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log
+#torchrun --nproc_per_node=$NGPUS \
+#    examples/swin/train_ds.py \
+#        --mbs 1 --gbs $GBS \
+#        --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
+#        --tp 2 --offload cpu \
+#    2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.ds.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log

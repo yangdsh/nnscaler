@@ -4,6 +4,7 @@
 from typing import Tuple, List, Dict, Callable, Optional, NewType, Set
 import os
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 import time
 import json
 
@@ -19,6 +20,9 @@ import operator
 from cube.ir.cten import IRTensor, IRObject, IRCell
 from cube.ir.operator import IRFwOperation
 from cube.graph.parser.register import CustomizedOps
+
+import logging
+_logger = logging.getLogger(__name__)
 
 
 Shapes = NewType('Shapes', Tuple[Tuple[int]])
@@ -152,8 +156,13 @@ class CompProfiler:
             torch.cuda.synchronize()
             train_memory = torch.cuda.memory_allocated() - entry
             assert train_memory >= 0, f"fn: {func.__name__}: Unexpected behaviour on decreased memory: {train_memory}"
-            torch.autograd.backward(outputs, grads)
-            torch.cuda.synchronize()
+            #with torch.profiler.profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
+            #profile_memory=True, 
+            #record_shapes=True) as prof:
+            if True:  
+                torch.autograd.backward(outputs, grads)
+                torch.cuda.synchronize()
+            #print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
             del outputs
 
         # ===================================================================
@@ -241,8 +250,8 @@ class ProfileDataBase:
         if isinstance(node, (IRGraphAnchor, IRPyFunc)) or node.name == 'multiref':
             return (0.0,) * 4
 
-        if self.exist(node):
-            return self.query(node)
+        #if self.exist(node):
+        #    return self.query(node)
 
         if isinstance(device, int):
             orig_device = torch.cuda.current_device()
@@ -471,17 +480,21 @@ class Estimator:
                 if not algo.satisfy(idx=idx, dim=dim, num=num):
                     return 1e9, 1e9, 1e9, 1e9
                 node = algo.instantiate(idx=idx, dim=dim, num=num)[0]
-        if self.database.exist(node):
+        if self.database.exist(node): # and node.name != "self_attention":
             return self.database.query(node)
         
         multiple, origin_node = 1, node
+        print(f'profile {node}')
         # split when a node is too large to be profiled inside one node
         if node.name in self._rules:
             idx, dim, num = self._rules[node.name]
             assert isinstance(node, IRDimops)
             algo = node.algorithms('dim')
+            # import pdb
+            # pdb.set_trace()
             if num > 1 and algo.satisfy(idx=idx, dim=dim, num=num):
                 node = algo.instantiate(idx=idx, dim=dim, num=num)[0]
+                print(f'profile a slice {node}')
                 multiple = num
 
         outs = self.database.profile(node, train)
@@ -640,7 +653,7 @@ class Estimator:
         attr = round((param_mem + grad_mem + buffer_mem) / 1024 / 1024 / 1024, 2)
         opt = round(opt_mem / 1024 / 1024 / 1024, 2)
         act = round(act_mem / 1024 / 1024 / 1024, 2)
-        print(f'memory: attr {attr} GB | opt {opt} GB | act {act} GB')
+        _logger.info(f'memory: param_mem + grad_mem + buffer_mem {attr} GB | optim state {opt} GB | peak activ {act} GB')
         return act_mem + param_mem + grad_mem + buffer_mem + opt_mem
 
     def __call__(self, nodes: Tuple[IRFwOperation],

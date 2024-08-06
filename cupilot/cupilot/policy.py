@@ -55,7 +55,9 @@ def staged_spmd(graph: IRGraph, resource,
     Returns: 
         spec (ParallelSpec): parallelization plan
     """
+    _logger.info(f'raw device memory capacity: {resource.gpus[0].memory}')
     mem_limit = resource.gpus[0].memory - 2 * 1024 * 1024 * 1024  # 2GB for nccl memory
+    _logger.info(f'device minus nccl memory capacity: {mem_limit}')
     mem_limit *= config.memory_fraction
     _logger.info(f'device memory capacity: {mem_limit}')
 
@@ -206,6 +208,7 @@ def policy(graph: IRGraph, resource,
             _logger.info(f'loading spec from {load_spec_file}...')
             spec = ParallelSpec.load(load_spec_file, graph)
         else:
+            _logger.info(f'max dp size (<= mbs): {config.max_dp_size}')
             spec = staged_spmd(graph,
                                resource, 
                                blocks,
@@ -285,13 +288,24 @@ def policy(graph: IRGraph, resource,
             # append data parallelism config
             # FIXME: this may lead to partition error if the node
             # can not be partitioned at idx=0,dim=0.
-            idxs.append(0 if isinstance(node, IRDimops) else None)
-            dims.append(0 if isinstance(node, IRDimops) else None)
-            nums.append(dp)
+            if 'self_attention' in node.name or node.name == 'feedforward':
+                idxs.append(0)
+                dims.append(1)
+                nums.append(dp)
+            else:
+                idxs.append(0 if isinstance(node, IRDimops) else None)
+                dims.append(0 if isinstance(node, IRDimops) else None)
+                nums.append(dp)
             # append tensor parallelism config
-            idxs.append(None if tp_strategy is None else tp_strategy[0])
-            dims.append(None if tp_strategy is None else tp_strategy[1])
-            nums.append(tp)
+            if tp_strategy is None:
+                idxs.append(None)
+                dims.append(None)
+                nums.append(tp)
+            else:
+                for i in range(0, len(tp_strategy), 3):
+                    idxs.append(tp_strategy[i])
+                    dims.append(tp_strategy[i+1])
+                    nums.append(tp_strategy[i+2])
             # apply nested tensor parallelism
             nested_tensor_parallelism(
                 graph, node, tuple(idxs), tuple(dims), tuple(nums), stage_devices)

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
 import json
 
@@ -17,14 +17,16 @@ class StageSpec:
     tp_size: int
     dp_size: int
     # node.cid -> (idx, num) | None
-    tp_spec: Dict[int, Optional[Tuple[int, int]]]
+    tp_spec: Dict[int, Optional[List[int]]]
     # node.cid -> node.name
     names: Dict[int, str]
 
     def __repr__(self) -> str:
         dscp = ''
         for cid, strategy in self.tp_spec.items():
-            strategy = 'Replicate' if strategy is None else f"idx={strategy[0]}, dim={strategy[1]}, num={self.tp_size}"
+            strategy = 'Replicate' if strategy is None else \
+                ''.join([f"idx={strategy[i]}, dim={strategy[i+1]}, num={strategy[i+2]}"\
+                    for i in range(0, len(strategy), 3)])
             dscp += f'  {self.names[cid]}({cid}): {strategy}\n'
         return dscp
 

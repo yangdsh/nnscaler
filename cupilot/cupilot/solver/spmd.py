@@ -68,6 +68,7 @@ class SpmdSolver:
               min_tp: int = 1, max_tp: int = 32,) -> Optional[StageSpec]:
 
         device_constraints = set()
+        _logger.debug(f'solve for {blocks[0].bid}-{blocks[-1].bid} devices: {devices}')
         for blk in blocks:
             if blk.devices is not None:
                 device_constraints.add(blk.devices)
@@ -100,6 +101,7 @@ class SpmdSolver:
         min_latency = None
 
         no_solution = False
+        best_tp = -1
         for dp in range(min_dp, min(len(devices) + 1, max_dp + 1)):
             # constraints: only search for gpu# of power of 2
             if not is_of_power2(dp): continue
@@ -126,8 +128,9 @@ class SpmdSolver:
 
             if min_latency is None or spec.est_latency < min_latency:
                 best_stage_spec = spec
+                best_tp = tp
                 min_latency = spec.est_latency
-        
+        _logger.debug(f'best_tp: {best_tp}')
         return best_stage_spec
 
     def get_key(self, blocks: List[IRBlock], dp_size: int, tp_size: int):
@@ -323,14 +326,13 @@ class SpmdSolver:
         for fnode in fnodes:
             split = None if tp_size == 1 else \
                 self.cost_model.partition_algos[fnode.cid][tp_spec[fnode.cid]]
-            stage_tp_spec[fnode.cid] = split
+            stage_tp_spec[fnode.cid] = None if split is None else (split[0], split[1], tp_size)
             names[fnode.cid] = fnode.name
 
         # estimate memory
         splits = []
         for fnode in fnodes:
             split = stage_tp_spec[fnode.cid]
-            split = None if split is None else (split[0], split[1], tp_size)
             splits.append(split)
         # assume adam optimizer
         span, mem_cost = self.cost_model.estimator(fnodes, splits, inflights)

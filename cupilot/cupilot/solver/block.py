@@ -180,6 +180,8 @@ class IRBlock:
         blocks = []
         for group in mitr.split_before(fnodes, lambda n: isinstance(n, IRGraphAnchor)):
             if len(group) == 0: continue
+            print('blocking')
+            print(IRBlock(graph, tuple(group)))
             blocks.append(IRBlock(graph, tuple(group)))
         if len(blocks) == 1:
             _logger.warning(f'Detected only 1 block, this may due to lack of IRGraphAnchor. '

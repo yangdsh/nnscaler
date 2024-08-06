@@ -226,7 +226,7 @@ class Executor:
     def check_clear():
         for name, npairs in Executor._detach.items():
             assert len(npairs) == 0, \
-                f"Fine remaining segment needs backward: {name}, remaining times: {len(npairs)}"
+                f"Found remaining segment needs backward: {name}, remaining times: {len(npairs)}"
 
 
 fexecute = Executor.fexecute

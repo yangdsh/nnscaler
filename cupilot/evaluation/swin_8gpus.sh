@@ -19,7 +19,7 @@ export USE_JIT_PARSER=1
 export DISABLE_INTER_RVD=1
 # export ASYNC_COMM=1
 
-GBS=256 # global batch size
+GBS=64 # global batch size
 
 
 # ================================= swin =============================
@@ -36,7 +36,7 @@ torchrun --nproc_per_node=$NGPUS \
     examples/swin/train.py \
         --mbs 1 --gbs $GBS --policy $POLICY \
         --layers $LAYERS --hidden $HIDDEN --heads $HEADS --img-size 1536 --window-size 48 \
-        --max-pp 2 --dev0-mem-limit 23 \
+        --max-pp 2 --dev0-mem-limit 14 --mem-frac 0.8\
         --recompute --db-cache swin_${GPU}_db.json --save-spec temp.json \
     2>&1 | tee ${LOGS}/${TOTAL_GPUS}gpus.$POLICY.layer${LAYERS}.hidden${HIDDEN}.heads${HEADS}.log
 

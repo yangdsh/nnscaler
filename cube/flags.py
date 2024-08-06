@@ -35,7 +35,8 @@ class CompileFlag:
     disable_code_line_info = _to_bool('DISABLE_CODE_LINE_INFO')  # will add original code information in generated code, note that this will make trace slow
 
     # ============== runtime ====================
-    dev_mode = _to_bool('SINGLE_DEV_MODE')  # allow to use python xx.py
+    dev_mode = _to_int('SINGLE_DEV_MODE')  # allow to use python xx.py
+    total_gpus = _to_int('TOTAL_GPUS')  # allow to use python xx.py
     async_comm = _to_bool('ASYNC_COMM')
 
     # ============== reducer ==================

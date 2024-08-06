@@ -617,6 +617,9 @@ class IRDimops(IRFwOperation):
 
         for anno in self._annos_candidates:
             anno = OpAnno(anno)
+            #if signature == 'examples.gpt.blocks.self_attention_gqa':
+            #    import pdb
+            #    pdb.set_trace()
             # expand * and check shape dimension consistency
             if self.align(inputs, anno, **kwargs):
                 self._iannos = anno.inputs()

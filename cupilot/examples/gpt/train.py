@@ -1,7 +1,11 @@
 import logging
 from functools import partial
+print = partial(print, flush=True)
 import more_itertools
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
+
+from typing import List
 
 from examples.gpt.model import Config, GPT, get_gpt_dummy_dataloader
 
@@ -10,16 +14,19 @@ from cube.profiler.timer import CudaTimer, print_each_rank
 from cube.profiler.memory import memory_summary
 from cube.runtime.device import DeviceGroup
 
+from cupilot.solver.block import IRBlock
 from cube.graph import IRGraph
 from cube.ir.operator import IRFwOperation
 from cube.graph.function.anchor import IRGraphAnchor
 
 import cupilot
 from cupilot.parallel.spmd import tensor_parallelism, replicate
+from cupilot.estimator.profiler import Estimator
 
 import argparse
 parser = argparse.ArgumentParser(parents=[cupilot.build_parser()],
                                  description='GPT Train')
+parser.add_argument('--dev-mode', type=int, default=0)
 parser.add_argument('--fp16', action='store_true', default=False)
 parser.add_argument('--mbs', type=int, default=1, help='micro-batch size')
 parser.add_argument('--gbs', type=int, default=256, help='global batch size')
@@ -27,7 +34,7 @@ parser.add_argument('--gbs', type=int, default=256, help='global batch size')
 parser.add_argument('--layers', type=int, required=True, help='number of encoder / decoder layers')
 parser.add_argument('--hidden', type=int, required=True)
 parser.add_argument('--heads', type=int, required=True)
-parser.add_argument('--seqlen', type=int, required=True)
+parser.add_argument('--seqlen', type=int, default=1024)
 parser.add_argument('--vocab', type=int, default=51200)
 # policy
 parser.add_argument('--policy', type=str, choices=['alpa', 'cupilot', 'megatron'], required=True)
@@ -38,11 +45,13 @@ parser.add_argument('--load-spec', type=str, default=None,
                     help='load searched tetris schedule from file')
 args = parser.parse_args()
 
+Estimator.register_rule('self_attention', 1, 0, 4)
+Estimator.register_rule('self_attention_gqa', 1, 0, 4)
 
 cube.init()
 print_each_rank(str(args), rank_only=0)
 
-cube.set_logger_level(logging.WARN)
+cube.set_logger_level(logging.INFO)
 for name in logging.root.manager.loggerDict:
     if name.startswith('cupilot'):
         logging.getLogger(name).setLevel(logging.INFO)
@@ -66,22 +75,22 @@ def setup_policy(args):
 
     elif args.policy == 'cupilot':
 
-        def constraint_fn(graph: IRGraph, resource):
-            nodes = graph.nodes()
-            embeds = graph.select(name='embedding')
-
-            start, stop = nodes.index(embeds[0]), nodes.index(embeds[-1])
-            segment = graph.group(nodes[start:stop+1])
-            cupilot.mark_standalone(segment)
-
+        def constraint_fn(graph: IRGraph, resource, blocks: List[IRBlock], constraints):
             devices = list(range(resource.ngpus))
-            for node in segment.nodes():
-                if node.name == 'embedding':
-                    tensor_parallelism(graph, node, idx=1, dim=0, devs=devices)
-                else:
-                    replicate(graph, node, devices)
 
-            return graph
+            # def fn(segment):
+            #     for node in segment.nodes():
+            #         if node.name == 'embedding':
+            #             tensor_parallelism(graph, node, idx=1, dim=0, devs=devices)
+            #         else:
+            #             replicate(graph, node, devices)
+
+            # for block in blocks:
+            #     for node in block.nodes:
+            #         if node.name == 'embedding':
+            #             block.mark_standalone(fn)
+            #             break
+            return blocks
 
         policy = partial(cupilot.policy,
                          nmicros=args.gbs//args.mbs,
@@ -121,7 +130,7 @@ def train():
         model = None
     dataloader = get_gpt_dummy_dataloader(args.mbs, cfg)
 
-    if torch.distributed.get_rank() == 0:
+    if args.dev_mode or torch.distributed.get_rank() == 0:
         nparams = 0
         for param in model.parameters():
             nparams += param.nelement()
@@ -132,8 +141,10 @@ def train():
     @cube.compile(model, dataloader, PAS=policy, load_content=False)
     def train_iter(model, dataloader):
         datas = next(dataloader)
-        loss = model(*datas)
-        loss.backward()
+        with record_function("model_forward"):
+            loss = model(*datas)
+        with record_function("model_backward"):
+            loss.backward()
         # return loss
     model = cube.load_model(load_content=False)
 
@@ -154,7 +165,6 @@ def train():
 
         if step == warmup:
             CudaTimer(enable=True, predefined=False).start('e2e')
-
         # training
         train_iter(model, dataloader)
         optimizer.step()
@@ -173,5 +183,4 @@ def train():
 
 
 if __name__ == '__main__':
-
     train()

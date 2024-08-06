@@ -23,14 +23,15 @@ class EnvResource:
 
         def __init__(self):
             # number of gpus
-            self.ngpus = 1 if CompileFlag.dev_mode else torch.distributed.get_world_size()
+            self.ngpus = CompileFlag.total_gpus if CompileFlag.dev_mode else torch.distributed.get_world_size()
+            print("CompileFlag.total_gpus: ", self.ngpus)
             # device topology
             self.topo = None
             self.gpus: Tuple[DeviceInfo] = self.get_device_capability()
 
         def get_device_capability(self) -> Tuple[DeviceInfo]:
             if CompileFlag.dev_mode:
-                memory = [torch.cuda.get_device_properties(0).total_memory]
+                memory = [torch.cuda.get_device_properties(0).total_memory] * self.ngpus
             else:
                 rank = torch.distributed.get_rank()
                 memory = torch.tensor(torch.cuda.get_device_properties(0).total_memory, 

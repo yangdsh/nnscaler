@@ -22,20 +22,21 @@ class DeviceGroup:
         def __init__(self):
             if CompileFlag.dev_mode:
                 self.rank = 0
-                self.world_size = 1
-                self.local_world_size = 1
+                self.world_size = CompileFlag.total_gpus
+                self.local_world_size = CompileFlag.total_gpus
                 self.local_rank = 0
                 self.node_rank = 0
+                print( f"world_size: {self.world_size}")
             else:
                 if not torch.distributed.is_initialized():
                     torch.distributed.init_process_group(backend='nccl')
                 self.rank = torch.distributed.get_rank()
                 self.world_size = torch.distributed.get_world_size()
+                print( f"world_size: {self.world_size}, rank: {self.rank}")
                 # assume each node has the same device number
                 self.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE'))
                 self.local_rank = int(os.environ.get('LOCAL_RANK'))
                 self.node_rank = int(os.environ.get('GROUP_RANK'))
-
             torch.cuda.set_device(self.local_rank)
             self.groups: Dict = { '1'*self.world_size: None }
             self.streams: Dict[str, torch.cuda.Stream] = {

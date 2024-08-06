@@ -149,7 +149,7 @@ class PlanBase:
             for devid in block.device:
                 if devid in self._step_devices[step+t]:
                     raise RuntimeError(
-                        f"inserting confict at device {devid} of time step {step+t}: "
+                        f"inserting blocks conflicted at device {devid} of time step {step+t}: "
                         f"cannot execute multiple blocks at a same time step")
         for t in range(block.span):
             self._step_blocks[step+t].append(block)
