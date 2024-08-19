@@ -287,15 +287,11 @@ def policy(graph: IRGraph, resource,
             idxs, dims, nums = [], [], []
             # append data parallelism config
             # FIXME: this may lead to partition error if the node
-            # can not be partitioned at idx=0,dim=0.
-            if 'self_attention' in node.name or node.name == 'feedforward':
-                idxs.append(0)
-                dims.append(1)
-                nums.append(dp)
-            else:
-                idxs.append(0 if isinstance(node, IRDimops) else None)
-                dims.append(0 if isinstance(node, IRDimops) else None)
-                nums.append(dp)
+            # can not be partitioned at idx=0,dim=1.
+            
+            idxs.append(0 if isinstance(node, IRDimops) else None)
+            dims.append(1 if isinstance(node, IRDimops) else None)
+            nums.append(dp)
             # append tensor parallelism config
             if tp_strategy is None:
                 idxs.append(None)
