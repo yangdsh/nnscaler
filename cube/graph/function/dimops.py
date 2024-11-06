@@ -551,6 +551,10 @@ class DimopSplit:
     @staticmethod
     def D(dims: Union[int, List[int]]):
         return DimopSplit(dims=dims)
+    
+    @staticmethod
+    def VD(dims: Union[int, List[int]]):
+        return DimopSplit(dims=dims, v=True)
 
 
 class TransformRule:
@@ -827,9 +831,22 @@ class IRDimops(IRFwOperation):
             for dim, edim in enumerate(eshape.dims):
                 for identifier, reduce in zip(edim.identifiers, edim.reduces):
                     if identifier in visited: continue
+                    # only consider the first identifier in the dim with ()
                     visited.add(identifier)
                     if identifier == '1' or self.anno.getlen(identifier) == 1: continue
+                    # TODO: consider pairwise configs
                     if reduce == DimAnno.ReduceType.Freeze: break
-                    configs.append((idx, dim))
+                    if idx == self.dp_idx and dim == self.dp_dim:
+                        # reserved for dp
+                        continue
+                    configs.append(([idx], [dim], []))
                     break
-        return configs
+        pairwise_configs = []
+        # TODO: consider pairwise configs
+        '''for config1 in configs:
+            for config2 in configs:
+                if config1 == config2: 
+                    continue
+                pairwise_configs.append((config1[0]+config2[0], config1[1]+config2[1]))
+        '''
+        return configs + pairwise_configs

@@ -25,7 +25,7 @@ class StageSpec:
         dscp = ''
         for cid, strategy in self.tp_spec.items():
             strategy = 'Replicate' if strategy is None else \
-                ''.join([f"idx={strategy[i]}, dim={strategy[i+1]}, num={strategy[i+2]}"\
+                '; '.join([f"idx={strategy[i]}, dim={strategy[i+1]}, num={strategy[i+2]}"\
                     for i in range(0, len(strategy), 3)])
             dscp += f'  {self.names[cid]}({cid}): {strategy}\n'
         return dscp

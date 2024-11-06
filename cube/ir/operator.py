@@ -26,6 +26,10 @@ class IRFwOperation(IRCell):
         @param input_length int: number of inputs
         @param output_length int: number of outputs
         """
+        # default index and dimension to perform data parallelism
+        self.dp_idx = 0
+        self.dp_dim = 0
+
         # recompute schedule
         self._recompute = None
         super().__init__(name, signature, len(inputs), num_outputs)
@@ -46,6 +50,12 @@ class IRFwOperation(IRCell):
         for idx, output in enumerate(outputs):
             self.set_output(idx, output)
 
+    def copy_args(self, other):
+        self.dp_idx = other.dp_idx
+        self.dp_dim = other.dp_dim
+        self._recompute = other._recompute
+        self._id = other._id
+    
     def infer_dtype(self):
         """
         Infer output value dtype.

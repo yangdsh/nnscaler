@@ -219,7 +219,7 @@ class IRCell:
 
     def set_output(self, index: int, val: NestedVarOrStatic):
         """
-        Set the node inputs[output_index] with the tensor
+        Set the node outputs[output_index] with the tensor
 
         Args:
             val (NestedVarOrStatic): (nested) IRObject or any deterministic value (int, bool, str, etc)

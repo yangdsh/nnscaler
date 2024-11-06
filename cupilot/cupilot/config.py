@@ -11,6 +11,8 @@ class CupilotConfig:
 
     # =============== staged spmd solver config ===============
 
+    # microbatch size
+    mbs = None
     # maximal number of data parallelism size
     max_dp_size: Optional[int] = None
     # maximal number of tensor parallelism size

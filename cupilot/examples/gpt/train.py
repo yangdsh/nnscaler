@@ -1,4 +1,5 @@
 import logging
+logging.getLogger("torch").setLevel(logging.ERROR)
 from functools import partial
 print = partial(print, flush=True)
 import more_itertools
@@ -11,7 +12,7 @@ from examples.gpt.model import Config, GPT, get_gpt_dummy_dataloader
 
 import cube
 from cube.profiler.timer import CudaTimer, print_each_rank
-from cube.profiler.memory import memory_summary
+from cube.profiler.memory import memory_summary, model_summary
 from cube.runtime.device import DeviceGroup
 
 from cupilot.solver.block import IRBlock
@@ -46,6 +47,7 @@ parser.add_argument('--load-spec', type=str, default=None,
 args = parser.parse_args()
 
 Estimator.register_rule('self_attention', 1, 0, 4)
+Estimator.register_rule('feedforward', 1, 1, 16)
 Estimator.register_rule('self_attention_gqa', 1, 0, 4)
 
 cube.init()
@@ -143,6 +145,7 @@ def train():
         datas = next(dataloader)
         with record_function("model_forward"):
             loss = model(*datas)
+            # model_summary(model, datas)
         with record_function("model_backward"):
             loss.backward()
         # return loss
@@ -151,7 +154,7 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, betas=(0.9, 0.999))
 
     torch.distributed.barrier()
-    print_each_rank('model weight consumpition:')
+    print_each_rank('model weight consumpition:', rank_only=0)
     memory_summary()
     nparams = 0
     for param in model.parameters():

@@ -392,9 +392,9 @@ class ExecutionPlan:
         for txt in txts:
             txt.set_fontsize(fontsize[0])
         for tick in ax.xaxis.get_major_ticks():
-            tick.label.set_fontsize(fontsize[0])
+            tick.label1.set_fontsize(fontsize[0])
         for tick in ax.yaxis.get_major_ticks():
-            tick.label.set_fontsize(fontsize[0])
+            tick.label2.set_fontsize(fontsize[0])
         plt.xlabel('Time Step', fontsize=fontsize[0])
         plt.ylabel('Device ID', fontsize=fontsize[0])
         plt.tight_layout()

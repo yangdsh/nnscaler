@@ -33,6 +33,18 @@ class StageSolver:
         # search caches: (nodes, ndevs, nstages) -> ParallelSpec
         self._cache: Dict[Tuple[Nodes, int, int], Optional[ParallelSpec]] = dict()
 
+    def print_est_cost(self, spec: ParallelSpec, fstages) -> float:
+        for i, stage in enumerate(spec.stages):
+            fnodes_ = fstages[i].nodes()
+            fnodes = []
+            for fnode in fnodes_:
+                if fnode.cid not in stage.tp_spec:
+                    continue
+                fnodes.append(fnode)
+            fnodes = self.spmd_solver.split_nodes_on_dp(fnodes, stage.dp_size)
+            t = self.spmd_solver.get_stage_est_cost(fnodes, stage, len(fstages))
+            _logger.info(f'stage {i}: {t} ms')
+    
     def solve(self, 
               nodes: Tuple[IRBlock],
               ndevs: int,

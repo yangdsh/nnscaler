@@ -29,7 +29,7 @@ class DimSplitEinops(GenericDistAlgo):
             * For outputs that don't have the identifier, will be partitioned on its value uniformly.
 
         * Spatial identifier (''):
-            * For inputs/outputs that have the identifier, will be partitioned on its diemnsion uniformly.
+            * For inputs/outputs that have the identifier, will be partitioned on its dimension uniformly.
             * For inputs/outputs that don't have the identifier, will be replicated
 
         * Frozen identifier ('^'):
@@ -42,7 +42,7 @@ class DimSplitEinops(GenericDistAlgo):
 
     Note the default rule isn't always expressive for all possible partition algorithms.
     E.g., linear xw + b to partition on reduction dimension,
-    whitch requires b to be value split but actually according to the default rule, will be replicated.
+    which requires b to be value split but actually according to the default rule, will be replicated.
     Therefore we require special rules for such cases.
     """
 
@@ -85,7 +85,7 @@ class DimSplitEinops(GenericDistAlgo):
 
         @return satisfy bool: true if can be partitioned, elsewise false.
         """
-        assert all(isinstance(cond, int) for cond in [idx, num]), "expect int condition"
+        assert all(isinstance(cond, int) for cond in [idx, num]), f"expect int {idx} {num}"
         assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         node: IRDimops = self.node
 
@@ -97,7 +97,6 @@ class DimSplitEinops(GenericDistAlgo):
         if isinstance(dim, int):
             dim = dim if dim >= 0 else dim + tensors[idx].ndims
             assert dim < tensors[idx].ndims, f"dimension output of boundary: {dim} >= {node.input(idx).ndims}"
-
         # try split at tensor spatial dimension
         if isinstance(dim, int):
             adim, reduce = self.get_identifier_reduce(idx, dim, num)
@@ -118,6 +117,19 @@ class DimSplitEinops(GenericDistAlgo):
                 if splits[idx].isV():
                     return True
             return False
+    
+    def nested_instantiate(self, idxs: List[int], dims: List[Union[int, str]],
+                           partitions: List[int]) -> Optional[List[IRDimops]]:
+        """Nested tensor parallelism"""
+        sub_nodes = [self.node]
+        for (idx, dim, num) in zip(idxs, dims, partitions):
+            for _ in range(len(sub_nodes)):
+                node = sub_nodes.pop(0)
+                result = [node] if num == 1 else self.instantiate(idx=idx, dim=dim, num=num)
+                if result is None:
+                    return None
+                sub_nodes += result
+        return sub_nodes
 
     def instantiate(self, idx: int, dim: Union[int, str], num: int) -> Optional[List[IRDimops]]:
 
@@ -131,9 +143,9 @@ class DimSplitEinops(GenericDistAlgo):
 
         if not satisfy:
             color, default = '\033[31m', '\033[0m'
-            _logger.info(f"split {node.name}: {node.anno} | dim: {adim} num: {num} reduce: {reduce} ... {color}{'Failed!'}{default}")
+            _logger.info(f"split {node.name}: {node.anno} | dim: {adim} dimlen: {node.anno.getlen(adim)} # num: {num} reduce: {reduce} ... {color}{'Failed!'}{default}")
             return None
-        rule: TransformRule = self.infer(idx, dim, num)
+        rule: TransformRule = self.infer([idx], [dim], num)
 
         # transform
         def transform(tensor: Any, split: DimopSplit) -> List[Any]:
@@ -170,7 +182,7 @@ class DimSplitEinops(GenericDistAlgo):
 
         return sub_nodes
 
-    def infer(self, idx: int, dim: Union[int, str], num: int) -> Optional[TransformRule]:
+    def infer(self, idxs: List[int], dims: List[Union[int, str]], num: int) -> Optional[TransformRule]:
         """
         Given the partition choice on `dim` dimension of idx-th input,
         return the partitioning of the output tensor.
@@ -181,10 +193,14 @@ class DimSplitEinops(GenericDistAlgo):
         @return rule TransformRule: the transformation rule
         """
         node: IRDimops = self.node
-        assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
+        # assert isinstance(dim, int) or dim == 'v', f"expect dim to be int or 'v'"
         # check node special rules first
         for r in node.transform_rules:
             splits = r.inputs() + r.outputs()
+            if len(dims) != 1:
+                raise ValueError(f"Error: expect dims to be 1 int for special rules")
+            idx = idxs[0]
+            dim = dims[0]
             if isinstance(dim, int):
                 if splits[idx].isD():
                     # make negative offset to be possitive
@@ -196,39 +212,75 @@ class DimSplitEinops(GenericDistAlgo):
                 if splits[idx].isV():
                     return r
         # otherwise use default rule
-        assert isinstance(dim, int), f"Error: expect dim to be int for default rules"
-        adim, reduce = self.get_identifier_reduce(idx, dim, num)
-        if reduce == DimAnno.ReduceType.Freeze:
-            return None
+        # assert isinstance(dims, List[int]), f"Error: expect dims to be List[int] for default rules"
+        adims = []
+        areduces = []
+        for idx, dim in zip(idxs, dims):    
+            adim, reduce = self.get_identifier_reduce(idx, dim, num)
+            if reduce == DimAnno.ReduceType.Freeze:
+                return None
+            adims.append(adim)
+            areduces.append(reduce)
         itransform, otransform = [], []
         # input
         for idx, idim in enumerate(node.anno.inputs()):
-            dims = idim.getdims(adim)
+            dims = []
+            for adim in adims:
+                dims += idim.getdims(adim)
             if len(dims) == 0:
                 itransform.append(DimopSplit.R())
             else:
-                if len(dims) > 1:
-                    _logger.warning(
-                        f'node ({self.node.name}-{self.node.cid}): detected an input tensor '
-                        f'is split on {len(dims)} dimensions, this will cause data loss.',
-                        stacklevel=0,
-                    )
+                # if len(dims) > 1:
+                #     _logger.warning(
+                #         f'node ({self.node.name}-{self.node.cid}): detected an input tensor '
+                #         f'is split on {len(dims)} dimensions, this will cause data loss.',
+                #         stacklevel=0,
+                #     )
                 itransform.append(DimopSplit.D(dims))
         # output
         for idx, odim in enumerate(node.anno.outputs()):
-            dims = odim.getdims(adim)
+            dims = []
+            reduces = []
+            other_reduces = []
+            for j, adim in enumerate(adims):
+                _dims = odim.getdims(adim)
+                # if len(_dims) > 1:
+                #     _logger.warning(
+                #         f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
+                #         f'has the same anno on {len(dims)} dimensions, this will cause data loss.',
+                #         stacklevel=0,
+                #     )
+                if len(_dims) == 1:
+                    reduces.append(areduces[j])
+                    dims += _dims
+                else:
+                    other_reduces.append(areduces[j])
+            # this output tensor doesn't have the identifier -> is not sharded
             if len(dims) == 0:
                 otransform.append(
-                    DimopSplit.R() if reduce == DimAnno.ReduceType.Dim else DimopSplit.V()
+                    DimopSplit.V() if DimAnno.ReduceType.Sum in other_reduces
+                    else DimopSplit.R()
                 )
-            else:
-                if len(dims) > 1:
-                    _logger.warning(
-                        f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
-                        f'is split on {len(dims)} dimensions, this will cause data loss.',
-                        stacklevel=0,
+            # this output tensor is sharded on 1 dimension
+            elif len(dims) == 1:
+                if DimAnno.ReduceType.Sum in other_reduces:
+                    _logger.info(
+                        f'node ({self.node.name}-{self.node.cid}): detected a tensor '
+                        f'is split on 1 dimension and has sum-reduce identifier on another dim, '
+                        f'which is not supported yet.'
                     )
+                    otransform.append(DimopSplit.VD(dims))
+                else:
+                    otransform.append(DimopSplit.D(dims))
+            # this output tensor is sharded on 2 dimensions
+            elif len(dims) == 2:
                 otransform.append(DimopSplit.D(dims))
+            else:
+                raise ValueError(
+                    f'node ({self.node.name}-{self.node.cid}): detected an output tensor '
+                    f'is split on {len(dims)} dimensions, this will cause data loss.'
+                )
+                
         # modifier
         def modify(kwargs: Dict, idx: int, dim: int, num: int):
             updated_kwargs = dict(**kwargs)
@@ -258,6 +310,8 @@ def collect_split_info(node: IRFwOperation):
 
     return split_info
 
+
+# not used
 def gen_partitions(node: IRFwOperation, ngpus: int) -> List[IRFwOperation]:
 
     def gen_hash(node: IRFwOperation) -> str:

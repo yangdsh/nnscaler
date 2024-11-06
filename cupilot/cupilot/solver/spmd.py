@@ -13,6 +13,7 @@ import warnings
 import time
 
 from cube.ir.operator import IRFwOperation
+from cube.graph.function.dimops import IRDimops, TransformRule, DimopSplit
 
 from .block import IRBlock
 from ..estimator.cost_model import CostModel
@@ -68,7 +69,7 @@ class SpmdSolver:
               min_tp: int = 1, max_tp: int = 32,) -> Optional[StageSpec]:
 
         device_constraints = set()
-        _logger.debug(f'solve for {blocks[0].bid}-{blocks[-1].bid} devices: {devices}')
+        _logger.debug(f'solve for blocks {blocks[0].bid}-{blocks[-1].bid}; devices: {devices}')
         for blk in blocks:
             if blk.devices is not None:
                 device_constraints.add(blk.devices)
@@ -130,12 +131,87 @@ class SpmdSolver:
                 best_stage_spec = spec
                 best_tp = tp
                 min_latency = spec.est_latency
-        _logger.debug(f'best_tp: {best_tp}')
+        # _logger.debug(f'best_tp: {best_tp}')
         return best_stage_spec
 
     def get_key(self, blocks: List[IRBlock], dp_size: int, tp_size: int):
         """Get the key of the solved problem"""
         return (tuple(blocks), dp_size, tp_size)
+    
+    def split_nodes_on_dp(self, nodes: List[IRFwOperation], dp_size: int):
+        dp_size = 1
+        """Split the nodes based on data parallelism size"""
+        fnodes = []
+        for node in nodes:
+            algo = node.algorithms('dim')
+            sub_node = algo.instantiate(idx=node.dp_idx, dim=node.dp_dim, num=dp_size)[0]
+            sub_node.copy_args(node)
+            # TODO: sub_node
+            fnodes.append(node)
+        return fnodes
+    
+    def get_stage_est_cost(self, fnodes: List[IRFwOperation], stage: StageSpec, inflights: int):
+        
+        total_span = 0
+        splits = []
+        cid2splits = {}
+        factor = stage.dp_size
+        for fnode in fnodes:
+            split = stage.tp_spec[fnode.cid]
+            # append data parallelism config
+            # idxs.append(node.dp_idx if isinstance(node, IRDimops) else None)
+            # dims.append(node.dp_dim if isinstance(node, IRDimops) else None)
+            # nums.append(dp)
+            # append tensor parallelism config
+            if split is None:
+                splits.append(None)
+            else:
+                idxs, dims, nums = [], [], []
+                for i in range(0, len(split), 3):
+                    idxs.append(split[i])
+                    dims.append(split[i+1])
+                    nums.append(split[i+2])
+                splits.append([idxs, dims, nums])
+            cid2splits[fnode.cid] = splits[-1]
+
+        # computation cost
+        span, mem_cost = self.cost_model.estimator(
+                fnodes, splits, inflights) 
+        mem_cost = mem_cost
+        total_span += span / factor
+
+        # communication cost
+        reshard_cost = 0
+        edges = self.cost_model.get_edges(fnodes)
+        for fnode_src, fnode_dsts in edges.items():
+            for fnode_dst in fnode_dsts:
+                tensor_idxs = self.cost_model.get_vtensor_to_idxs(fnode_src, fnode_dst)
+                for tensor, (idx_src, idx_dst) in tensor_idxs.items():
+                    rule_src = None
+                    if cid2splits[fnode_src.cid] is not None:
+                        idxs, dims, num = cid2splits[fnode_src.cid]
+                        rule_src = fnode_src.algorithms('dim').infer(idxs, dims, num)
+                    rule_dst = None
+                    if cid2splits[fnode_dst.cid] is not None:
+                        idxs, dims, num = cid2splits[fnode_dst.cid]
+                        rule_dst = fnode_dst.algorithms('dim').infer(idxs, dims, num)
+                    reshard_cost += self.cost_model.comm_cost(
+                            tensor, stage.tp_size, 
+                            rule_src.outputs()[idx_src] if rule_src is not None else DimopSplit(r=True),
+                            rule_dst.inputs()[idx_dst] if rule_dst is not None else DimopSplit(r=True),
+                            stage.tp_spec[fnode_dst.cid] is None
+                        )
+        total_span += reshard_cost / factor
+        total_span = total_span / 3 * 4 if self.recompute else total_span
+        return total_span
+            
+    def get_partitions_from_partials(self, tp_size: int, partials: List[int]) -> List[int]:
+        partitions = []
+        for i in partials:
+            partitions.append(i)
+            tp_size = tp_size // i
+        partitions.append(tp_size)
+        return partitions
 
     def _solve(self,
                blocks: List[IRBlock],
@@ -162,12 +238,16 @@ class SpmdSolver:
         """
         key = self.get_key(blocks, dp_size, tp_size)
         if key in self._cache:
+            # print(f"cache hit: {key}")
             return self._cache[key]
 
         tic = time.time()
 
         fnodes: List[IRFwOperation] = list(more_itertools.flatten(blk.nodes for blk in blocks))
         fnodes = self.cost_model.get_search_nodes(fnodes)
+        fnodes = self.split_nodes_on_dp(fnodes, dp_size)
+        factor = dp_size
+        # fnodes_with_anchor
 
         # create variables (nodes)
         s, d, c = {}, {}, {}  # partition index, computation cost, communication cost
@@ -179,18 +259,22 @@ class SpmdSolver:
             algos = self.cost_model.partition_algos[fnode.cid]
             npartitions = len(algos)
             s[cid] = LpVariable.matrix(f's[{num_nodes}]', (range(npartitions),), cat='Binary')
-            d[cid] = self.cost_model.get_comp_cost(fnode, tp_size).flatten() / dp_size
-            c[cid] = self.cost_model.get_comm_cost(fnode, tp_size).flatten() / dp_size
+            d[cid] = self.cost_model.get_comp_cost(fnode, tp_size).flatten() / factor
+            c[cid] = self.cost_model.get_comm_cost(fnode, tp_size).flatten() / factor
+            assert len(s[cid]) == len(d[cid]) == len(c[cid])
             # setup initial value
             for pidx, strategy in enumerate(algos):
                 if strategy is None: continue
-                idx, dim = strategy
-                identifier = fnode.anno.input(idx)[dim].identifiers[0]
-                # we constrain a node that can only be evenly partitioned
-                if fnode.anno.getlen(identifier) % (tp_size * dp_size) != 0:
-                    s[cid][pidx].setInitialValue(False)
-                    s[cid][pidx].fixValue()
-                    npartitions -= 1
+                idxs, dims, partials = strategy
+                partitions = self.get_partitions_from_partials(tp_size, partials)
+                for idx, dim, partition in zip(idxs, dims, partitions):
+                    identifier = fnode.anno.input(idx)[dim].identifiers[0]
+                    # we constrain a node that can only be evenly partitioned
+                    if fnode.anno.getlen(identifier) % partition != 0:
+                        s[cid][pidx].setInitialValue(False)
+                        s[cid][pidx].fixValue()
+                        npartitions -= 1
+                        break
             # remove replicate choice if we have other choices to
             # partition nodes to save memory
             if self.memory_saving and npartitions > 1 and algos[0] is None:
@@ -212,7 +296,7 @@ class SpmdSolver:
                 e.append(LpVariable.matrix(f"e[{src.cid}, {dst.cid}]",
                                            (range(nsrc * ndst),),
                                            cat='Binary'))
-                r.append(self.cost_model.get_pair_reshard_cost(src, dst, tp_size).flatten())
+                r.append(self.cost_model.get_pair_reshard_cost(src, dst, tp_size).flatten() / factor)
                 num_edges += 1
 
         # initial value: --skip
@@ -223,7 +307,7 @@ class SpmdSolver:
         obj = 0
         for fnode in fnodes:
             cid = fnode.cid
-            obj += lpDot(s[cid], c[cid]) + lpDot(s[cid], d[cid])
+            obj += lpDot(s[cid], d[cid]) # + lpDot(s[cid], c[cid])
         # communication cost
         for i in range(num_edges):
             obj += lpDot(e[i], r[i])
@@ -242,15 +326,17 @@ class SpmdSolver:
         eidx = 0
         for src, dsts in edges.items():
             for dst in dsts:
-                for row in range(len(s[src.cid])):
-                    C = len(s[dst.cid])
-                    prob += lpSum(
-                        e[eidx][row * C + col] for col in range(0, C)) <= s[src.cid][row]
-                for col in range(len(s[dst.cid])):
-                    R = len(s[src.cid])
-                    C = len(s[dst.cid])
-                    prob += lpSum(
-                        e[eidx][row * C + col] for row in range(0, R)) <= s[dst.cid][col]
+                C = len(s[dst.cid]) if dst.cid in s else 1
+                R = len(s[src.cid]) if src.cid in s else 1
+
+                if src.cid in s:
+                    for row in range(R):
+                        prob += lpSum(
+                            e[eidx][row * C + col] for col in range(0, C)) <= s[src.cid][row]
+                if dst.cid in s:
+                    for col in range(C):
+                        prob += lpSum(
+                            e[eidx][row * C + col] for row in range(0, R)) <= s[dst.cid][col]
                 eidx += 1
 
         # b) memory constraint --skip
@@ -305,18 +391,6 @@ class SpmdSolver:
             index = get_non_zero_index(s[fnode.cid])
             tp_spec[fnode.cid] = index
 
-        # check results
-        e_val = np.full((num_edges,), -1, dtype=np.int32)
-        eidx = 0
-        for (src, dsts) in edges.items():
-            for dst in dsts:
-                e_val[eidx] = get_non_zero_index(e[eidx])
-                src_spec_index = e_val[eidx] // len(s[dst.cid])
-                dst_spec_index = e_val[eidx] % len(s[dst.cid])
-                assert src_spec_index == tp_spec[src.cid]
-                assert dst_spec_index == tp_spec[dst.cid]
-                eidx += 1
-
         if objective > 1e13:
             warnings.warn("Detect unexpected behaviors in the auto-sharding pass.")
 
@@ -326,7 +400,8 @@ class SpmdSolver:
         for fnode in fnodes:
             split = None if tp_size == 1 else \
                 self.cost_model.partition_algos[fnode.cid][tp_spec[fnode.cid]]
-            stage_tp_spec[fnode.cid] = None if split is None else (split[0], split[1], tp_size)
+            stage_tp_spec[fnode.cid] = None if split is None else (
+                split[0], split[1], self.get_partitions_from_partials(tp_size, split[2]))
             names[fnode.cid] = fnode.name
 
         # estimate memory
@@ -343,6 +418,13 @@ class SpmdSolver:
             stage = None
         else:
             objective = objective + init_comp
+            for fnode in fnodes:
+                split = stage_tp_spec[fnode.cid]
+                if split:
+                    flatten_split = []
+                    for i in range(len(split[0])):
+                        flatten_split += [split[0][i], split[1][i], split[2][i]]
+                    stage_tp_spec[fnode.cid] = flatten_split
             stage = StageSpec(
                 est_latency=objective / 3 * 4 if self.recompute else objective,
                 est_memory=mem_cost,
@@ -351,7 +433,11 @@ class SpmdSolver:
                 tp_spec=stage_tp_spec,
                 names=names,
             )
+            est_cost = self.get_stage_est_cost(fnodes, stage, inflights)
+            if abs(est_cost - stage.est_latency) > 1e-3:
+                _logger.debug(f"Estimation error: {est_cost} vs {stage.est_latency}")
             _logger.debug(f'results of {len(stage_tp_spec)} nodes: tp={tp_size}, dp={dp_size} '
-                          f'lat={round(objective, 2)} ms, mem={round(mem_cost/1024/1024/1024, 2)} GB')
+                          f'lat={round(stage.est_latency, 2)} ms, cost={round(est_cost, 2)} ms, '
+                          f'mem={round(mem_cost/1024/1024/1024, 2)} GB')
         self._cache[key] = stage
         return stage

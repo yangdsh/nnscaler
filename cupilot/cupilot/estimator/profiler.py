@@ -451,14 +451,14 @@ class Estimator:
         reload = cache if os.path.exists(cache) else None
         self.database = ProfileDataBase(reload)
 
-    def perf(self, node: IRFwOperation, split: Split = None, train: bool = True):
+    def perf(self, node: IRFwOperation, split = None, train: bool = True):
         """Query the node performance with partition configurations.
 
         If the performance data doesn't exsit in database, will profile in runtime.
 
         Args:
             node (IRFwOperation): the queried node
-            split (Tuple[int, int, int] or None):
+            split (Tuple[List[int], List[int], List[int]] or None):
                 Only for IRDimops, the config should be (idx, dim, num)
 
         Returns:
@@ -475,11 +475,11 @@ class Estimator:
         if split is not None:
             assert isinstance(node, IRDimops)
             algo = node.algorithms('dim')
-            idx, dim, num = split
-            if num > 1:
-                if not algo.satisfy(idx=idx, dim=dim, num=num):
-                    return 1e9, 1e9, 1e9, 1e9
-                node = algo.instantiate(idx=idx, dim=dim, num=num)[0]
+            idxs, dims, partitions = split
+            sub_nodes = algo.nested_instantiate(idxs=idxs, dims=dims, partitions=partitions)
+            if not sub_nodes:
+                return 1e9, 1e9, 1e9, 1e9
+            node = sub_nodes[0]
         if self.database.exist(node): # and node.name != "self_attention":
             return self.database.query(node)
         
@@ -504,59 +504,6 @@ class Estimator:
             outs = tuple(i * multiple for i in outs)
             self.database.insert(origin_node, *outs)
         return outs
-
-    def profile_transform_space(self, node: IRFwOperation, max_num: int = 32, train: bool = True) -> None:
-        """Profile the node at its full transformation space
-
-        The profiled results will be logged into database.
-
-        Note:
-            Only IRDimops will be profiled with multiple transformation choices.
-            Other nodes of IRFwOperation can only be replicated and therefore
-            have no partitioning space. 
-
-            The partitioned number will be limited to power of 2,
-            e.g., 2, 4, 8, 16, ...
-
-        Args:
-            node (IRFwOperation): the profiled node
-            max_num (int): the maximal number of partitioned node
-
-        Returns:
-            None
-        """
-        splits = [None]
-        nodes = [node]
-        if isinstance(node, IRDimops):
-            algo = node.algorithms('dim')
-            for (idx, dim) in node.transform_space():
-                num = 2
-                while num <= max_num:
-                    if algo.satisfy(idx=idx, dim=dim, num=num):
-                        sub_node = algo.instantiate(idx=idx, dim=dim, num=num)[0]
-                        nodes.append(sub_node)
-                        splits.append((idx, dim, num))
-                        num *= 2
-                    else:
-                        break
-        # print(f'profile {node.name} with configs: {splits}')
-        for n in nodes:
-            self.perf(n, train=train)
-
-    def profile_model(self, graph: IRSegment):
-        """Profile the operators in the graph
-        
-        Each operator will be profiled by all possible transformation space.
-        The profiled results will be logged into database.
-
-        Args:
-            graph (IRSegment): the graph
-
-        Returns:
-            None
-        """
-        for node in graph.select(ntype=IRFwOperation):
-            self.profile_transform_space(node, train=(node.mirror is not None))
 
     def peak_activation_mem(self, nodes: Tuple[IRFwOperation],
                             inflights: int = 1, train: bool = True):
@@ -684,9 +631,9 @@ class Estimator:
             if split is None:
                 snodes.append(node)
             else:
-                idx, dim, num = split
+                idxs, dims, partitions = split
                 algo = node.algorithms('dim')
-                sub_node = algo.instantiate(idx=idx, dim=dim, num=num)[0]
+                sub_node = algo.nested_instantiate(idxs=idxs, dims=dims, partitions=partitions)[0]
                 sub_node.recompute = node.recompute
                 snodes.append(sub_node)
 

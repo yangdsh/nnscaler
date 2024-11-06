@@ -45,8 +45,17 @@ def auto_multiref(graph: IRGraph, plan: ParallelSpec):
                 if spec is None:
                     splits.add(None)
                 else:
-                    idx, dim = spec
-                    rule: TransformRule = consumer.algorithms('dim').infer(idx, dim, 1)
+                    idxs, dims, partitions = [], [], []
+                    for i in range(0, len(spec), 3):
+                        idxs.append(spec[i])
+                    for i in range(1, len(spec), 3):
+                        dims.append(spec[i])
+                    for i in range(2, len(spec), 3):
+                        partitions.append(spec[i])
+                    try:
+                        rule: TransformRule = consumer.algorithms('dim').infer(idxs, dims, partitions[0])
+                    except:
+                        import pdb; pdb.set_trace()
                     split = rule.inputs()[consumer.inputs().index(ctensor)]
                     splits.add(split)
         if len(splits) > 1 and ftensor.requires_grad:

@@ -67,7 +67,7 @@ def staged_spmd(graph: IRGraph, resource,
     # step 2. build cost model for communiation
     _logger.info(f'building cost model...')
     CostModel.ndevs_per_node = DeviceGroup().local_world_size
-    cost_model = CostModel(graph, estimator, constraints)
+    cost_model = CostModel(graph, estimator, constraints, config.max_dp_size, config.max_tp_size, config.mbs)
     latency, memory = estimator(graph.select(ntype=IRFwOperation))
     _logger.info(f'estimate single device latency per microbatch: {round(latency, 2)} ms, '
                  f'memory: {round(memory/1024/1024/1024, 2)} GB')
@@ -110,17 +110,8 @@ def staged_spmd(graph: IRGraph, resource,
         max_t=config.max_tp_size,
         max_p=config.max_pp_size
     )
-    # - search with stage solver
-    spec = stage_solver.solve(
-        solver_blocks,
-        resource.ngpus,
-        memory_limit_bytes=mem_limit,
-        init_mem_cost=tuple(init_mem_cost),
-        init_comp_cost=tuple(init_comp_cost)
-    )
 
-    # TODO: add standalone blocks in spec
-    return spec
+    return stage_solver, solver_blocks, mem_limit, init_mem_cost, init_comp_cost
 
 
 def policy(graph: IRGraph, resource,
@@ -153,6 +144,7 @@ def policy(graph: IRGraph, resource,
     config = CupilotConfig() if config is None else config
     config.max_dp_size = mbs if config.max_dp_size is None \
         else min(mbs, config.max_dp_size)
+    config.mbs = mbs
     
     # TODO: support estimator with zero
     if config.zero_size > 0:
@@ -204,17 +196,26 @@ def policy(graph: IRGraph, resource,
 
     # staged_spmd search -- only apply on rank 0 to ensure deterministic
     if DeviceGroup().rank == 0:
+        stage_solver, solver_blocks, mem_limit, init_mem_cost, init_comp_cost = staged_spmd(graph,
+                            resource, blocks, constraints, config)
         if isinstance(load_spec_file, str):
             _logger.info(f'loading spec from {load_spec_file}...')
             spec = ParallelSpec.load(load_spec_file, graph)
         else:
             _logger.info(f'max dp size (<= mbs): {config.max_dp_size}')
-            spec = staged_spmd(graph,
-                               resource, 
-                               blocks,
-                               constraints,
-                               config)
+            spec = stage_solver.solve(
+                solver_blocks,
+                resource.ngpus,
+                memory_limit_bytes=mem_limit,
+                init_mem_cost=tuple(init_mem_cost),
+                init_comp_cost=tuple(init_comp_cost)
+            )
+        # group nodes into stages
+        fstages: List[IRSegment] = stage_blocks(graph, blocks, spec)
+        _logger.info(f'staged-spmd: grouped into {len(fstages)} stages')
         _logger.info(f'parallel spec results:\n{spec.str(nmicros)}')
+        _logger.info(f'print_est_cost:\n')
+        stage_solver.print_est_cost(spec, fstages)
 
         if isinstance(save_spec_file, str):
             _logger.info(f'saving spec to {save_spec_file}...')
@@ -239,10 +240,6 @@ def policy(graph: IRGraph, resource,
         _logger.info(f'parallel spec results:\n{spec.str(nmicros)}')
     
     _logger.info(f'instantiate plan...')
-
-    # group nodes into stages
-    fstages: List[IRSegment] = stage_blocks(graph, blocks, spec)
-    _logger.info(f'staged-spmd: grouped into {len(fstages)} stages')
 
     # apply multiref to the nodes where a same tensor is partitioned differently on the nodes.
     auto_multiref(graph, spec)
@@ -286,11 +283,8 @@ def policy(graph: IRGraph, resource,
             
             idxs, dims, nums = [], [], []
             # append data parallelism config
-            # FIXME: this may lead to partition error if the node
-            # can not be partitioned at idx=0,dim=1.
-            
-            idxs.append(0 if isinstance(node, IRDimops) else None)
-            dims.append(1 if isinstance(node, IRDimops) else None)
+            idxs.append(node.dp_idx if isinstance(node, IRDimops) else None)
+            dims.append(node.dp_dim if isinstance(node, IRDimops) else None)
             nums.append(dp)
             # append tensor parallelism config
             if tp_strategy is None:

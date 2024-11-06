@@ -12,6 +12,7 @@ from cube.ir.cten import IRTensor
 from cube.ir.operator import IRFwOperation
 from cube.graph.function.anchor import IRGraphAnchor
 from cube.graph.function.dimops import IRDimops, TransformRule, DimopSplit
+from cube.graph.function.function import Identity
 
 from .profiler import Estimator
 from ..constraints import Constraints
@@ -28,9 +29,9 @@ class CommCost:
     Get communication cost in milliseconds
     """
 
-    ndevs_per_node: int = 8
+    ndevs_per_node: int = 2
     intra_node_gbps = 600  # actually nvlink have more than this, but it cannot fully saturate the bandwidth
-    inter_node_gbps = 100  # consider 100 gbps ib network
+    inter_node_gbps = 60  # consider 100 gbps ib network
 
     @staticmethod
     def set_bandwidth(intra_node: int, inter_node: int):
@@ -88,14 +89,14 @@ class CostModel:
     the cost model.
     """
 
-    def __init__(self, graph: IRGraph, estimator: Callable, constraints: Constraints, max_tp: int = 32):
+    def __init__(self, graph: IRGraph, estimator: Callable, constraints: Constraints, max_dp: int = 8, max_tp: int = 32, mbs: int = 1):
 
         self.graph: IRGraph = graph
         self.estimator: Estimator = estimator
         self.constraints = constraints
 
         # [node.cid] = (None, (idx1, dim1), ...)
-        self.partition_algos: Dict[int, Tuple[int, int]] = {}
+        self.partition_algos: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
         # [node.cid][ndevs] = np.array(...)
         self.comp_cost = {}
         self.mem_cost = {}
@@ -110,6 +111,7 @@ class CostModel:
         # between constrained nodes and un-constrainted nodes
         all_fnodes = graph.select(ntype=IRFwOperation)
         fnodes = self.get_search_nodes(all_fnodes)
+        self.set_dp_idx_dim(fnodes, mbs)
         
         # setup producer
         for producer in fnodes:
@@ -138,13 +140,20 @@ class CostModel:
                 node_mem_cost = []
                 for config in self.partition_algos[fnode.cid]:
                     if num > 1 and config is not None:
-                        split = (config[0], config[1], num)
+                        partitions = []
+                        for i in config[2]:
+                            partitions.append(i)
+                            num = num // i
+                        partitions.append(num)
+                        split = (config[0], config[1], partitions)
                     else:
                         split = None
         
                     try:
                         infer_span, infer_mem, train_span, train_mem = \
                             self.estimator.perf(fnode, split, train)
+                        if fnode.name == 'feedforward':
+                            _logger.info(f'perf node:\n {fnode.name}[{fnode.cid}], split: {split}, train_span: {train_span}, train_mem: {round(train_mem / 1024 / 1024, 2)}')
                     except Exception as e:
                         _logger.error(f'fail to profile node: {fnode.name}[{fnode.cid}], split: {split}, saving profiled data...')
                         self.estimator.save()
@@ -192,10 +201,14 @@ class CostModel:
         Get computation cost related to different partition strategies
         """
         # return np.zeros(len(self.partition_algos[fnode.cid]), dtype=float)
+        if fnode.cid not in self.comp_cost:
+            return 0
         return self.comp_cost[fnode.cid][num_devices]
 
     def get_comm_cost(self, fnode: IRFwOperation, num_devices) -> np.ndarray:
         """
+        @deprecated
+        
         Get communication cost for a node given a strategy
 
         This only calucates the cases for partitioning on value dimension
@@ -208,13 +221,58 @@ class CostModel:
                 cost.append(0.)
                 continue
             s_cost = 0
-            idx, dim = strategy
-            rule: TransformRule = fnode.algorithms('dim').infer(idx, dim, num_devices)
+            idxs, dims, partitions = strategy
+            rule: TransformRule = fnode.algorithms('dim').infer(idxs, dims, num_devices)
             for idx, output in enumerate(rule.outputs()):
                 if output.isV():
                     s_cost += CommCost.allreduce_cost(fnode.output(idx), num_devices)
             cost.append(s_cost)
         return np.array(cost, dtype=float)
+    
+    def get_vtensor_to_idxs(self, fnode_src: IRFwOperation,
+                          fnode_dst: IRFwOperation) -> Dict[IRTensor, Tuple[int, int]]:
+        # FIXME: need consider cases that an operator has multiple **same** inputs
+        tensors: Dict[IRTensor, Tuple[int, int]] = {}
+        for idx, output in enumerate(fnode_src.outputs()):
+            tensors[output.parent] = [idx]
+        for idx, input in enumerate(fnode_dst.inputs()):
+            if not isinstance(input, IRTensor): continue
+            tensors.setdefault(input.parent, []).append(idx)
+        tensors = {t: tuple(v) for t, v in tensors.items() if len(v) == 2}
+        # only consider ptensors that have exactly 2 vtensors
+        return tensors
+    
+    def comm_cost(self, tensor: IRTensor, num_devices: int,
+                src_split: DimopSplit, dst_split: DimopSplit, dst_replica: bool):
+        # note for data parallel, we don't consider allreduce cost as it
+        # will only be performed at the last of iteration.
+        if tensor.is_attr(): return 0.0
+        if src_split.isR():
+            # identity-allreduce or identity-identity
+            if dst_split.isR():
+                return 0 if dst_replica else \
+                        CommCost.allreduce_cost(tensor, num_devices)
+            # identity-allgather
+            if dst_split.isD():
+                return CommCost.allgather_cost(tensor, num_devices)
+        if src_split.isV():
+            # allreduce-allreduce or allreduce-identity
+            if dst_split.isR():
+                return CommCost.allreduce_cost(tensor, num_devices) if dst_replica else \
+                        CommCost.allreduce_cost(tensor, num_devices) * 2
+            # reducescatter-allgather
+            if dst_split.isD():
+                return CommCost.allgather_cost(tensor, num_devices) + \
+                        CommCost.reducescatter_cost(tensor, num_devices)
+        if src_split.isD():
+            # allgahter-reducescatter or allgather-split
+            if dst_split.isR():
+                return CommCost.allgather_cost(tensor, num_devices) if dst_replica else \
+                        CommCost.allgather_cost(tensor, num_devices) + CommCost.reducescatter_cost(tensor, num_devices)
+            # all2all-all2all or identity-identity
+            if dst_split.isD():
+                return 0.0 if src_split == dst_split else 2 * CommCost.alltoall_cost(tensor, num_devices)
+        raise NotImplementedError(f"Unknown split type: {src_split} -> {dst_split}")
     
     def get_pair_reshard_cost(self, fnode_src: IRFwOperation, fnode_dst: IRFwOperation, 
                               num_devices: int) -> np.ndarray:
@@ -228,57 +286,30 @@ class CostModel:
         ndst = len(self.partition_algos[fnode_dst.cid])
         cost = np.zeros((nsrc, ndst), dtype=float)
 
-        def comm_cost(tensor: IRTensor, num_devices: int,
-                      src_split: DimopSplit, dst_split: DimopSplit, dst_replica: bool):
-            # note for data parallel, we don't consider allreduce cost as it
-            # will only be performed at the last of iteration.
-            if tensor.is_attr(): return 0.0
-            if src_split.isV() or src_split.isR():
-                # identity-allreduce or identity-identity
-                if dst_split.isR():
-                    return 0.0 if dst_replica else CommCost.allreduce_cost(tensor, num_devices)
-                # split-allgather
-                if dst_split.isD():
-                    return CommCost.allgather_cost(tensor, num_devices)
-            if src_split.isD():
-                # allgahter-reducescatter or allgather-split
-                if dst_split.isR():
-                    return CommCost.allgather_cost(tensor, num_devices) if dst_replica else \
-                           CommCost.allgather_cost(tensor, num_devices) + CommCost.reducescatter_cost(tensor, num_devices)
-                # all2all-all2all or identity-identity
-                if dst_split.isD():
-                    return 0.0 if src_split == dst_split else 2 * CommCost.alltoall_cost(tensor, num_devices)
-            raise NotImplementedError(f"Unknown split type: {src_split} -> {dst_split}")
-
-        # FIXME: need consider cases that an operator has multiple **same** inputs
-        tensors: Dict[IRTensor, Tuple[int, int]] = {}
-        for idx, output in enumerate(fnode_src.outputs()):
-            tensors[output.parent] = [idx]
-        for idx, input in enumerate(fnode_dst.inputs()):
-            if not isinstance(input, IRTensor): continue
-            tensors.setdefault(input.parent, []).append(idx)
-        tensors = {t: tuple(v) for t, v in tensors.items() if len(v) == 2}
-
+        tensors = self.get_vtensor_to_idxs(fnode_src, fnode_dst)
         for i, strategy_src in enumerate(self.partition_algos[fnode_src.cid]):
 
             rule_src = None
             if strategy_src is not None:
-                idx, dim = strategy_src
-                rule_src = fnode_src.algorithms('dim').infer(idx, dim, num_devices)
+                idxs, dims, _ = strategy_src
+                rule_src = fnode_src.algorithms('dim').infer(idxs, dims, num_devices)
             
             for j, strategy_dst in enumerate(self.partition_algos[fnode_dst.cid]):
                 rule_dst = None
                 if strategy_dst is not None:
-                    idx, dim = strategy_dst
-                    rule_dst = fnode_dst.algorithms('dim').infer(idx, dim, num_devices)
+                    idxs, dims, _ = strategy_dst
+                    rule_dst = fnode_dst.algorithms('dim').infer(idxs, dims, num_devices)
 
                 for tensor, (idx_src, idx_dst) in tensors.items():
-                    cost[i, j] += comm_cost(
-                        tensor, num_devices, 
-                        rule_src.outputs()[idx_src] if rule_src is not None else DimopSplit(r=True),
-                        rule_dst.inputs()[idx_dst] if rule_dst is not None else DimopSplit(r=True),
-                        strategy_dst is None
-                    )
+                    try:
+                        cost[i, j] += self.comm_cost(
+                            tensor, num_devices, 
+                            rule_src.outputs()[idx_src] if rule_src is not None else DimopSplit(r=True),
+                            rule_dst.inputs()[idx_dst] if rule_dst is not None else DimopSplit(r=True),
+                            strategy_dst is None
+                        )
+                    except:
+                        import pdb; pdb.set_trace()
         return cost
 
     def get_edges(self, nodes: List[IRFwOperation]) -> Dict[IRFwOperation, Tuple[IRFwOperation]]:
@@ -290,6 +321,18 @@ class CostModel:
         for node in nodes:
             if node.cid in self.edges:
                 edges[node] = [cid2nodes[cid] for cid in self.edges[node.cid] if cid in cid2nodes]
+        
+        # create virtual nodes for the input and output of the stage
+        first_node = Identity(nodes[0].inputs()[0])
+        first_node.outputs = first_node.inputs
+        self.partition_algos[first_node.cid] = [None]
+        #edges[first_node] = [nodes[0]]
+        
+        last_node = Identity(nodes[-1].outputs()[0])
+        last_node.outputs = last_node.inputs
+        self.partition_algos[last_node.cid] = [None]
+        #edges[nodes[-1]] = [last_node]
+        
         return edges
 
     def get_search_nodes(self, nodes: List[IRFwOperation]) -> List[IRFwOperation]:
@@ -324,3 +367,26 @@ class CostModel:
                 continue
             fnodes.append(fnode)
         return fnodes
+    
+    def set_dp_idx_dim(self, nodes: List[IRFwOperation], mbs: int):
+        """Set the first dim == mbs to be the data parallel dimension"""
+        for fnode in nodes:
+            matched = False
+            ashapes = fnode.anno.inputs() + fnode.anno.outputs()
+            for idx, eshape in enumerate(ashapes):
+                if idx < len(fnode.inputs()):
+                    if not isinstance(fnode.input(idx), IRTensor): continue
+                if eshape.ignore: continue  # skip '?'
+                for dim, edim in enumerate(eshape.dims):
+                    for identifier, reduce in zip(edim.identifiers, edim.reduces):
+                        if identifier == '1' or fnode.anno.getlen(identifier) == 1: continue
+                        if fnode.anno.getlen(identifier) == mbs:
+                            fnode.dp_idx = idx
+                            fnode.dp_dim = dim
+                            _logger.info(f"set dp_idx: {idx}, dp_dim: {dim} for {fnode.name}[{fnode.cid}]")
+                            matched = True
+                            break
+                    if matched: break
+                if matched: break
+                    
+            
